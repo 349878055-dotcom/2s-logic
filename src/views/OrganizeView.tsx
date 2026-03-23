@@ -12,6 +12,7 @@ import {
   EMOTION_OPTIONS, PHYSIOLOGY_OPTIONS, CLASS_OPTIONS, BANNER_STATES,
 } from "@/lib/engines/constants";
 import DoesSlider from "@/components/DoesSlider";
+import { dispatchWorkflow } from "@/workflow_registry";
 
 // ──────────────────────────────────────────────────────────
 // CharacterModelingEngine
@@ -68,10 +69,20 @@ function CharacterModelingEngine({
   const removeAnchor = (id: string) =>
     updateField("anchors", form.anchors.filter(a => a.id !== id));
 
-  const handleGenerate = () => {
+  const handleGenerate = async () => {
     if (!form.name) return;
     setGenerating(true);
-    setTimeout(() => { setGenerating(false); onSave(form); }, 900);
+    try {
+      await dispatchWorkflow({
+        action: "ORGANIZE_COMMIT_CHARACTER_PROFILE",
+        payload: { snapshot: form },
+      });
+      onSave(form);
+    } catch (e) {
+      console.error("工厂加工失败:", e);
+    } finally {
+      setGenerating(false);
+    }
   };
 
   return (

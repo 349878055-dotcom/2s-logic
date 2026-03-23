@@ -7,11 +7,9 @@ import { useState, useRef, useEffect } from "react";
 import { useSearchParams } from "next/navigation";
 import type { SeedState, NovelChapter } from "@/lib/core/store";
 import { generateSeedId } from "@/lib/engines/utils";
-import { seedToSoraPrompt } from "@/lib/engines/will_engine";
-import { calculateInertiaShift, commitAdoption } from "@/lib/engines/engine_evolving";
-import { requestContentStream } from "@/lib/engines/utils";
-import { getSeedVault } from "@/lib/engines/actions/seedVault";
 import type { SeedVaultEntry } from "@/lib/engines/actions/seedVault";
+import { dispatchWorkflow } from "@/workflow_registry";
+import type { ProcessUnit, ScriptProjectDTO } from "@/lib/workflow/fulfillment";
 
 // ── 变体预览项 ─────────────────────────────────────────────
 interface VariantItem {
@@ -24,28 +22,6 @@ interface CharacterTrack {
   name: string;
   seedId: string;
   seed: SeedState;
-}
-
-// ── 加工单元：逻辑片段 + 人物轨道 ───────────────────────────
-interface ProcessUnit {
-  id: string;
-  novel: string;
-  script: string;
-  storyboard: string;
-  seedState: SeedState;
-  /** 指向原文的字符位置（全局坐标），用于左侧高亮联动与后台索引 */
-  textRange?: { start: number; end: number };
-  anchorText?: string;
-  event_trace?: { trigger: string };
-  identity?: {
-    character_name?: string;
-    social_profile: string;
-    social_background?: string;
-  };
-  characters?: CharacterTrack[];
-  isReconstructing?: boolean;
-  variants?: VariantItem[];
-  chapterIndex?: number; // 所属章节索引，用于断点续传
 }
 
 // ── 🕵️‍♂️ 监制专属层级钻取：带有物理坐标索引的目录树 ─────────────
@@ -241,30 +217,8 @@ function SeedFolderDrillDown({
   );
 }
 
-// ── 剧本存档 ─────────────────────────────────────────────
-interface ScriptProject {
-  id: string;
-  name: string;
-  units: ProcessUnit[];
-  inputText: string;
-  seedId?: string | null;
-  lockProgress?: number;
-  chapters?: NovelChapter[];
-  personas?: Array<{ name: string; summary: string }>;
-}
-
-function toScriptProject(raw: { id: string; name: string; inputText?: string; chapters?: NovelChapter[]; segments?: ProcessUnit[]; seedId?: string | null; lockProgress?: number; personas?: Array<{ name: string; summary: string }> }): ScriptProject {
-  return {
-    id: raw.id,
-    name: raw.name,
-    inputText: raw.inputText ?? "",
-    units: raw.segments ?? [],
-    chapters: raw.chapters,
-    seedId: raw.seedId,
-    lockProgress: raw.lockProgress,
-    personas: raw.personas,
-  };
-}
+// ── 剧本存档（与 fulfillment.ScriptProjectDTO 对齐）────────────
+type ScriptProject = ScriptProjectDTO;
 
 export default function TranspilerView() {
   const searchParams = useSearchParams();
@@ -373,17 +327,10 @@ export default function TranspilerView() {
 
   const handleNewScript = async () => {
     try {
-      const res = await fetch("/api/projects", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ownerId: OWNER_ID, name: `未命名小说 ${projects.length + 1}` }),
-      });
-      const data = (await res.json()) as { project?: { id: string; name: string }; error?: string };
-      if (!res.ok || !data.project) {
-        setCompileError(data.error ?? "项目创建失败");
-        return;
-      }
-      const newProject = toScriptProject({ ...data.project, inputText: "", segments: [], chapters: [] });
+      const newProject = await dispatchWorkflow({
+        action: "TRANSPILER_NEW_PROJECT",
+        payload: { ownerId: OWNER_ID, name: `未命名小说 ${projects.length + 1}` },
+      }) as ScriptProject;
       setProjects((prev) => [...prev, newProject]);
       setActiveProject(newProject);
       setUnits([]);
@@ -420,12 +367,12 @@ export default function TranspilerView() {
       setSelectedFragment(null);
       return;
     }
-    // 从数据库加载（断点续传）
     try {
-      const res = await fetch(`/api/projects/${projectId}`);
-      const data = (await res.json()) as { project?: { id: string; name: string; inputText?: string; chapters?: NovelChapter[]; segments?: ProcessUnit[]; seedId?: string | null; lockProgress?: number; personas?: Array<{ name: string; summary: string }> } };
-      if (!res.ok || !data.project) return;
-      const proj = toScriptProject(data.project);
+      const proj = await dispatchWorkflow({
+        action: "TRANSPILER_LOAD_PROJECT",
+        payload: { projectId },
+      }) as ScriptProject | null;
+      if (!proj) return;
       setProjects((prev) => {
         const exists = prev.some((p) => p.id === proj.id);
         return exists ? prev.map((p) => (p.id === proj.id ? proj : p)) : [...prev, proj];
@@ -463,10 +410,9 @@ export default function TranspilerView() {
     setProjects((prev) => prev.map((p) => (p.id === activeProject.id ? { ...p, ...payload } : p)));
     setActiveProject((prev) => (prev ? { ...prev, ...payload } : null));
     try {
-      await fetch(`/api/projects/${activeProject.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+      await dispatchWorkflow({
+        action: "TRANSPILER_SAVE_PROJECT",
+        payload: { projectId: activeProject.id, body: payload as unknown as Record<string, unknown> },
       });
       console.log(`[CMD] 项目《${activeProject.name}》已物理固化至数据库`);
     } catch (e) {
@@ -478,8 +424,11 @@ export default function TranspilerView() {
   const handleDeleteProject = async (projectId: string) => {
     if (!confirm("确定要永久删除此项目及其所有逻辑资产吗？此操作不可逆。")) return;
     try {
-      const res = await fetch(`/api/projects/${projectId}`, { method: "DELETE" });
-      if (res.ok) {
+      const ok = await dispatchWorkflow({
+        action: "TRANSPILER_DELETE_PROJECT",
+        payload: { projectId },
+      }) as boolean;
+      if (ok) {
         const remaining = projects.filter((p) => p.id !== projectId);
         setProjects(remaining);
         setActiveProject(remaining[0] ?? null);
@@ -501,16 +450,16 @@ export default function TranspilerView() {
     }
   };
 
-  // 从数据库加载项目列表（断点续传），OWNER_ID 变化时自动重新加载
   useEffect(() => {
     let cancelled = false;
     setProjectsLoading(true);
-    fetch(`/api/projects?ownerId=${OWNER_ID}`)
-      .then((r) => r.json())
-      .then((data: { projects?: Array<{ id: string; name: string; inputText?: string; chapters?: NovelChapter[]; segments?: ProcessUnit[]; seedId?: string | null; lockProgress?: number; personas?: Array<{ name: string; summary: string }> }> }) => {
+    (async () => {
+      try {
+        const mapped = await dispatchWorkflow({
+          action: "TRANSPILER_LIST_PROJECTS",
+          payload: { ownerId: OWNER_ID },
+        }) as ScriptProject[];
         if (cancelled) return;
-        const list = data.projects ?? [];
-        const mapped = list.map(toScriptProject);
         setProjects(mapped);
         if (mapped.length > 0) {
           setActiveProject(mapped[0]);
@@ -529,152 +478,63 @@ export default function TranspilerView() {
           setDiscoveredCharacters([]);
           setCompiled(false);
         }
-      })
-      .finally(() => { if (!cancelled) setProjectsLoading(false); });
+      } finally {
+        if (!cancelled) setProjectsLoading(false);
+      }
+    })();
     return () => { cancelled = true; };
   }, [OWNER_ID]);
 
   useEffect(() => {
-    if (isAdmin) {
-      getSeedVault().then(setSeedVaultData);
-    }
+    if (!isAdmin) return;
+    (async () => {
+      const rows = await dispatchWorkflow({ action: "ADMIN_SEED_VAULT_SNAPSHOT", payload: {} }) as SeedVaultEntry[];
+      setSeedVaultData(rows);
+    })();
   }, [isAdmin]);
 
-  /** 建立目录：极速扫描全文，生成章节索引，成功后原子化入库 */
   const handleExtractChapters = async () => {
     const full = (inputText || activeProject?.inputText || "").trim();
     if (!full) return;
-
-    // 如果没有项目，自动建一个，别让监管账户卡住
-    let currentProject = activeProject;
-    if (!currentProject) {
-      try {
-        const res = await fetch("/api/projects", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ownerId: OWNER_ID, name: `未命名小说 ${projects.length + 1}` }),
-        });
-        const data = (await res.json()) as { project?: { id: string; name: string }; error?: string };
-        if (!res.ok || !data.project) {
-          setCompileError(data.error ?? "项目创建失败");
-          return;
-        }
-        const newProject = toScriptProject({ ...data.project, inputText: full, segments: [], chapters: [] });
-        setProjects((prev) => [...prev, newProject]);
-        setActiveProject(newProject);
-        currentProject = newProject;
-      } catch (e) {
-        setCompileError(e instanceof Error ? e.message : "项目创建异常");
-        return;
-      }
-    }
 
     setIsExtractingChapters(true);
     setCompileError(null);
     setExtractionProgress(0);
     setExtractionLog("");
     try {
-      let res = await fetch("/api/chapters/stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ inputText: full }),
-      });
-      if (!res.ok || !res.body) {
-        setExtractionLog("流式接口不可用，改用普通接口...");
-        res = await fetch("/api/chapters", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ inputText: full }),
-        });
-        const data = (await res.json()) as { chapters?: NovelChapter[]; error?: string };
-        if (!res.ok) {
-          setCompileError(data.error ?? "目录提取失败");
-          return;
-        }
-        const newChapters = data.chapters ?? [];
-        setChapters(newChapters);
-        setSelectedChapterIndex(null);
-        setActiveChapter(null);
-        setUnits([]);
-        setCompiled(false);
-        setActiveProject((prev) => (prev ? { ...prev, inputText: full, chapters: newChapters } : null));
-        setProjects((prev) => prev.map((p) => (p.id === currentProject!.id ? { ...p, inputText: full, chapters: newChapters } : p)));
-        setInputText("");
-        await fetch("/api/save-index", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ projectId: currentProject!.id, chapters: newChapters }),
-        });
-        await fetch(`/api/projects/${currentProject!.id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ inputText: full }),
-        });
+      const out = await dispatchWorkflow({
+        action: "TRANSPILER_EXTRACT_CHAPTERS",
+        payload: {
+          fullText: full,
+          ownerId: OWNER_ID,
+          projectsCount: projects.length,
+          activeProjectId: activeProject?.id ?? null,
+          onProgress: (progress: number, log: string) => {
+            setExtractionProgress(progress);
+            setExtractionLog(log);
+          },
+        },
+      }) as
+        | { ok: true; chapters: NovelChapter[]; projectId: string; createdNewProject: boolean; bootstrapProject?: ScriptProject }
+        | { ok: false; error: string };
+
+      if (!out.ok) {
+        setCompileError(out.error);
         return;
       }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let newChapters: NovelChapter[] = [];
-      let hasError = false;
-      const processChunk = (chunk: string) => {
-        if (!chunk.startsWith("data: ")) return;
-        try {
-          const data = JSON.parse(chunk.slice(6)) as {
-            type: string;
-            progress?: number;
-            log?: string;
-            chapters?: NovelChapter[];
-            error?: string;
-          };
-          if (data.type === "progress") {
-            setExtractionProgress(data.progress ?? 0);
-            setExtractionLog(data.log ?? "");
-          } else if (data.type === "done" && data.chapters) {
-            newChapters = data.chapters;
-          } else if (data.type === "error") {
-            setCompileError(data.error ?? "目录提取失败");
-            hasError = true;
-          }
-        } catch {
-          /* ignore parse errors */
-        }
-      };
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (value) buffer += decoder.decode(value, { stream: !done });
-        const lines = buffer.split("\n\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) processChunk(line);
-        if (done) {
-          if (buffer.trim()) processChunk(buffer.trim());
-          break;
-        }
-        if (hasError) break;
+      if (out.createdNewProject && out.bootstrapProject) {
+        setProjects((prev) => [...prev, out.bootstrapProject!]);
+        setActiveProject(out.bootstrapProject);
       }
-      if (hasError) return;
-      setChapters(newChapters);
+      const pid = out.projectId;
+      setChapters(out.chapters);
       setSelectedChapterIndex(null);
       setActiveChapter(null);
       setUnits([]);
       setCompiled(false);
-      setActiveProject((prev) => (prev ? { ...prev, inputText: full, chapters: newChapters } : null));
-      setProjects((prev) => prev.map((p) => (p.id === currentProject!.id ? { ...p, inputText: full, chapters: newChapters } : p)));
+      setActiveProject((prev) => (prev ? { ...prev, inputText: full, chapters: out.chapters } : null));
+      setProjects((prev) => prev.map((p) => (p.id === pid ? { ...p, inputText: full, chapters: out.chapters } : p)));
       setInputText("");
-
-      // 立即入库：保存 startIndex、endIndex、anchor
-      await fetch("/api/save-index", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projectId: currentProject!.id, chapters: newChapters }),
-      });
-      // 同步原文到项目
-      await fetch(`/api/projects/${currentProject!.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ inputText: full }),
-      });
     } catch (e) {
       setCompileError(e instanceof Error ? e.message : "目录提取异常");
     } finally {
@@ -684,7 +544,6 @@ export default function TranspilerView() {
     }
   };
 
-  /** 全书人物普查：扫描全文，弹出人物列表，并固化到项目档案 */
   const handleDiscoverCharacters = async () => {
     const full = inputText || activeProject?.inputText || "";
     if (!full.trim()) {
@@ -694,27 +553,21 @@ export default function TranspilerView() {
     setIsDiscoveringCharacters(true);
     setCompileError(null);
     try {
-      const res = await fetch("/api/discover-characters", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ inputText: full }),
-      });
-      const data = (await res.json()) as { characters?: Array<{ name: string; summary?: string; bio?: string }>; error?: string };
-      if (!res.ok) {
-        setCompileError(data.error ?? `HTTP ${res.status}`);
+      const disc = await dispatchWorkflow({
+        action: "TRANSPILER_DISCOVER_CHARACTERS",
+        payload: { inputText: full },
+      }) as { ok: true; list: Array<{ name: string; summary: string }> } | { ok: false; error: string };
+      if (!disc.ok) {
+        setCompileError(disc.error);
         return;
       }
-      const list = (data.characters ?? []).map((c) => ({
-        name: c.name,
-        summary: String(c.summary ?? c.bio ?? "").trim().slice(0, 80),
-      }));
+      const list = disc.list;
       setDiscoveredCharacters(list);
       setShowCharacterModal(true);
       if (activeProject && list.length > 0) {
-        await fetch("/api/init-persona", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ projectId: activeProject.id, characters: list }),
+        await dispatchWorkflow({
+          action: "TRANSPILER_INIT_PERSONA",
+          payload: { projectId: activeProject.id, characters: list },
         });
         setActiveProject((p) => (p ? { ...p, personas: list } : null));
         setProjects((prev) => prev.map((p) => (p.id === activeProject.id ? { ...p, personas: list } : p)));
@@ -726,7 +579,6 @@ export default function TranspilerView() {
     }
   };
 
-  /** 全局常量固化：一次性把所有人物名单发给后端进行物理切片扫描，11 维数据存入 Seed Vault */
   const handleSolidifyAll = async () => {
     if (!activeProject || discoveredCharacters.length === 0) return;
     const full = inputText || activeProject.inputText || "";
@@ -739,17 +591,15 @@ export default function TranspilerView() {
     setCompileError(null);
     try {
       const personaNames = discoveredCharacters.map((c) => c.name);
-      const res = await fetch("/api/solidify-all", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const data = await dispatchWorkflow({
+        action: "TRANSPILER_SOLIDIFY_ALL",
+        payload: {
           projectId: activeProject.id,
           personaNames,
           fullText: full,
-        }),
-      });
-      const data = (await res.json()) as { ok?: boolean; error?: string };
-      if (res.ok) {
+        },
+      }) as { ok: boolean; error?: string };
+      if (data.ok) {
         console.log("[龙骨引擎] 全局常量固化成功，11 维数据已存入 Seed Vault");
         setDiscoveredCharacters((prev) => prev.map((c) => ({ ...c, isSolidified: true })));
         setSolidifyProgress(100);
@@ -765,23 +615,16 @@ export default function TranspilerView() {
     }
   };
 
-  /** 按需编译：点击章节时才编译该章节，每一步都记录入库；charName 动态传入，支持人物档案选择 */
   const handleCompileChapter = async (chapter: NovelChapter, index: number, charName: string) => {
     const full = inputText || activeProject?.inputText || "";
     if (!full || !activeProject) return;
-    // 切肉坐标防护：endIndex 为 0 或无效时，用全文长度兜底
     const endIdx = chapter.endIndex > chapter.startIndex ? chapter.endIndex : full.length;
     const chapterText = full.slice(chapter.startIndex, endIdx);
-    console.log("[监制审计] 准备编译章节:", chapter.title);
-    console.log("[监制审计] 物理坐标:", chapter.startIndex, "->", chapter.endIndex);
-    console.log("[监制审计] 文本长度:", chapterText.length, "字符");
-    console.log("DEBUG: 准备脱水的文本片段：", chapterText.slice(0, 50) + "...");
     if (chapterText.length < 10) {
       setCompileError("物理对齐失败：切片内容过短或为空，请重新生成排版。");
       return;
     }
     if (!chapterText.trim()) {
-      console.error("❌ 切肉失败：chapterText 为空，请检查排版坐标封口");
       setCompileError("切肉失败：章节坐标异常，请重新生成排版");
       return;
     }
@@ -794,40 +637,26 @@ export default function TranspilerView() {
     setCurrentSeedId(null);
     setLockProgress(0);
     try {
-      const res = await fetch("/api/compile", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          inputText: chapterText,
-          mode: "parsing",
-          charId: "main_char",
-          charName,
+      const data = await dispatchWorkflow({
+        action: "TRANSPILER_COMPILE_CHAPTER",
+        payload: {
+          chapterText,
           projectId: activeProject.id,
           chapterIndex: index,
           chapterStartIndex: chapter.startIndex,
-        }),
-      });
-      const data = (await res.json()) as { units?: ProcessUnit[]; primarySeedId?: string; lockProgress?: number; error?: string };
-      const list = data.units ?? [];
-      if (!res.ok) {
-        setCompileError(data.error ?? `HTTP ${res.status}`);
+          charName,
+        },
+      }) as
+        | { ok: true; units: ProcessUnit[]; primarySeedId?: string; lockProgress?: number }
+        | { ok: false; error: string };
+
+      if (!data.ok) {
+        setCompileError(data.error);
         return;
       }
-      if (list.length === 0) {
-        console.error("❌ 编译空跑：AI 没吐出任何逻辑片段", data.error ? `| 服务端报错: ${data.error}` : "");
-        setCompileError(data.error ?? "编译完成但未提取到任何逻辑片段，可能是 AI 安全拦截或人物轨道未识别");
-        return;
-      }
-      // 修正 textRange 为全书全局坐标
-      const offset = chapter.startIndex;
-      const adjustedUnits = list.map((u) => ({
-        ...u,
-        textRange: u.textRange
-          ? { start: u.textRange.start + offset, end: u.textRange.end + offset }
-          : undefined,
-      }));
+      const adjustedUnits = data.units;
       setUnits(adjustedUnits);
-      setCurrentSeedId(data.primarySeedId ?? (list.length > 0 ? generateSeedId() : null));
+      setCurrentSeedId(data.primarySeedId ?? (adjustedUnits.length > 0 ? generateSeedId() : null));
       setLockProgress(data.lockProgress ?? 100);
       setCompiled(true);
       const updatedChapters = chapters.map((c, i) => (i === index ? { ...c, isCompiled: true } : c));
@@ -837,13 +666,6 @@ export default function TranspilerView() {
       const mergedUnits = [...existingUnits.filter((u) => u.chapterIndex !== index), ...withChapterIndex];
       setActiveProject((prev) => (prev ? { ...prev, chapters: updatedChapters, units: mergedUnits } : null));
       setProjects((prev) => prev.map((p) => (p.id === activeProject.id ? { ...p, chapters: updatedChapters, units: mergedUnits } : p)));
-
-      // 立刻入库：保存 11 维逻辑基因和剧本
-      await fetch("/api/save-segments", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projectId: activeProject.id, chapterIndex: index, units: adjustedUnits }),
-      });
     } catch (e) {
       console.error("🔥 编译彻底崩了，原因如下:", e);
       setCompileError(e instanceof Error ? e.message : "网络或编译异常");
@@ -852,7 +674,6 @@ export default function TranspilerView() {
     }
   };
 
-  /** 整本编译（兼容旧流程） */
   const handleCompile = async () => {
     if (!inputText.trim() || !activeProject) return;
     setIsCompiling(true);
@@ -863,33 +684,23 @@ export default function TranspilerView() {
     setLockProgress(0);
     setSelectedChapterIndex(null);
     try {
-      const res = await fetch("/api/compile", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          inputText,
-          mode: "parsing",
-          projectId: activeProject.id,
-          chapterIndex: -1,
-        }),
-      });
-      const data = (await res.json()) as { units?: ProcessUnit[]; primarySeedId?: string; lockProgress?: number; error?: string };
-      const list = data.units ?? [];
-      if (!res.ok || (list.length === 0 && data.error)) {
-        setCompileError(data.error ?? `HTTP ${res.status}`);
+      const data = await dispatchWorkflow({
+        action: "TRANSPILER_COMPILE_FULL_BOOK",
+        payload: { inputText, projectId: activeProject.id },
+      }) as
+        | { ok: true; units: ProcessUnit[]; primarySeedId?: string; lockProgress?: number }
+        | { ok: false; error: string };
+      if (!data.ok) {
+        setCompileError(data.error);
         return;
       }
+      const list = data.units;
       setUnits(list);
       setActiveProject((prev) => (prev ? { ...prev, inputText, units: list } : null));
       setProjects((prev) => prev.map((p) => (p.id === activeProject.id ? { ...p, inputText, units: list } : p)));
       setCurrentSeedId(data.primarySeedId ?? (list.length > 0 ? generateSeedId() : null));
       setLockProgress(data.lockProgress ?? 100);
       setCompiled(true);
-      await fetch("/api/save-segments", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projectId: activeProject.id, chapterIndex: -1, units: list }),
-      });
     } catch (e) {
       setCompileError(e instanceof Error ? e.message : "网络或编译异常");
     } finally {
@@ -906,44 +717,34 @@ export default function TranspilerView() {
     );
 
     try {
-      const isVary = !!currentSeedId && units.length > 0;
-      const results = await requestContentStream({
-        prompt: unit.novel,
-        originalText: unit.script,
-        userPrompt: directorInstruction || undefined,
-        ...(isVary && {
-          action: "vary" as const,
-          seed: currentSeedId!,
+      const hasVary = !!currentSeedId && units.length > 0;
+      const raw = await dispatchWorkflow({
+        action: "TRANSPILER_GENERATE_VARIANTS",
+        payload: {
+          prompt: unit.novel,
+          originalText: unit.script,
+          userPrompt: directorInstruction || undefined,
+          currentSeedId,
           baseState: unit.seedState,
-        }),
-      });
-      const variants: VariantItem[] = results.map((r) => ({ text: r.text, state: r.state! }));
+          hasVary,
+        },
+      }) as Array<{ text: string; state: SeedState }>;
+      const variants: VariantItem[] = raw.map((r) => ({ text: r.text, state: r.state }));
       setUnits((prev) => prev.map((u) => (u.id === unitId ? { ...u, isReconstructing: false, variants } : u)));
-    } catch (err) {
+    } catch {
       setUnits((prev) => prev.map((u) => (u.id === unitId ? { ...u, isReconstructing: false } : u)));
     }
   };
 
-  const handleAdoptVariant = (unitId: string, variantIndex: number) => {
+  const handleAdoptVariant = async (unitId: string, variantIndex: number) => {
     const unit = units.find((u) => u.id === unitId);
     if (!unit?.variants?.[variantIndex]) return;
-
-    const adopted = commitAdoption(unit.seedState, unit.variants[variantIndex].state);
-    const chars = unit.characters ?? [{ name: "核心主角", seedId: unit.id.slice(0, 6), seed: unit.seedState }];
-    setUnits((prev) =>
-      prev.map((u) =>
-        u.id === unitId
-          ? {
-              ...u,
-              seedState: adopted,
-              script: unit.variants![variantIndex].text,
-              storyboard: seedToSoraPrompt(adopted, "SHOT 01"),
-              variants: [],
-              characters: chars.map((c, i) => (i === 0 ? { ...c, seed: adopted } : c)),
-            }
-          : u
-      )
-    );
+    const patched = (await dispatchWorkflow({
+      action: "TRANSPILER_ADOPT_VARIANT",
+      payload: { unit, variantIndex },
+    })) as ProcessUnit | null;
+    if (!patched) return;
+    setUnits((prev) => prev.map((u) => (u.id === unitId ? patched : u)));
   };
 
   const highlightInOriginal = (anchorText: string | undefined, full: string) => {
@@ -1107,10 +908,9 @@ export default function TranspilerView() {
                           if (name) {
                             setActiveProject((prev) => (prev?.id === p.id ? { ...prev, name } : prev));
                             setProjects((prev) => prev.map((proj) => (proj.id === p.id ? { ...proj, name } : proj)));
-                            fetch(`/api/projects/${p.id}`, {
-                              method: "PATCH",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ name }),
+                            void dispatchWorkflow({
+                              action: "TRANSPILER_RENAME_PROJECT",
+                              payload: { projectId: p.id, name },
                             }).catch(console.error);
                           }
                           setEditingProjectId(null);

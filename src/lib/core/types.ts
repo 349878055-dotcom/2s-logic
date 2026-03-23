@@ -28,6 +28,39 @@ export interface ProbabilityMatrix<T extends string> {
 
 export interface DoesValues { d: number; o: number; e: number; s: number }
 
+/**
+ * 11 维人格 OS — 归一化标量（0.0–1.0）。
+ * 与遗留 {@link DoesValues}（0–100 四轴）并行存在；新 A→B→C 流水线以本接口为准。
+ */
+export interface ElevenDimensions {
+  dominance: number;
+  order: number;
+  ego: number;
+  sociality: number;
+  bandwidth: number;
+  stress: number;
+  compute: number;
+  logic_link: number;
+  target_goal: number;
+  anchor: number;
+  ego_type: number;
+}
+
+/** 性格简码 token，如 `<E9>`、`<S1>` */
+export type LexToken = string;
+
+/**
+ * A（Seed）→ B（LEX）→ C（Render）流水线数据载体。
+ * - dimensions：环节 A 输出的 11 维向量
+ * - lexCode：环节 B 输出的拼接简码
+ * - narrativeContext：环节 C 使用的大纲/叙事上下文
+ */
+export interface WorkflowPayload {
+  dimensions: ElevenDimensions;
+  lexCode: string;
+  narrativeContext: string;
+}
+
 export interface ScriptFragment {
   id: number; scene: string; location: string;
   tag: string; tagColor: string; content: string;

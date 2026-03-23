@@ -7,6 +7,7 @@ import type { SeedState } from "@/lib/core/store";
 import { DIMENSIONS } from "@/lib/engines/constants";
 import DoesSlider from "@/components/DoesSlider";
 import ConstraintBadge from "@/components/ConstraintBadge";
+import { dispatchWorkflow } from "@/workflow_registry";
 
 // ── 语义化演化模式：以该片段的 Seed 为父级，定向偏移 ─────────────────
 const EVOLUTION_MODES = [
@@ -45,11 +46,19 @@ export default function EditView({
     }
     setSeedLoading(true);
     setRealSeedState(null);
-    fetch(`/api/seed?id=${selectedFrag.seedId}`)
-      .then((r) => (r.ok ? r.json() : Promise.reject(r)))
-      .then((data: SeedState) => setRealSeedState(data))
-      .catch(() => setRealSeedState(null))
-      .finally(() => setSeedLoading(false));
+    (async () => {
+      try {
+        const data = await dispatchWorkflow({
+          action: "EDIT_FETCH_SEED_SNAPSHOT",
+          payload: { seedId: selectedFrag.seedId },
+        }) as SeedState | null;
+        setRealSeedState(data);
+      } catch {
+        setRealSeedState(null);
+      } finally {
+        setSeedLoading(false);
+      }
+    })();
   }, [selectedFrag?.seedId]);
   const getDoes = (id: number): DoesValues =>
     fragmentDoes[id] ?? { d: 72, o: 55, e: 88, s: 41 };
@@ -84,31 +93,30 @@ export default function EditView({
       3: "试图感化对方，提高共情与安全感",
       4: "打破惯性，加入意料之外的转折",
     };
-    let prompt = forcePrompt ?? (rewritePrompt.trim() || (variantType ? defaultPrompts[variantType] : `基于当前 D.O.E.S 参数（${selectedDim} 主导）微调`));
-    if (lockEnv && !forcePrompt) prompt = `[LOCK_ENV] ${prompt}`;
+    let promptText = forcePrompt ?? (rewritePrompt.trim() || (variantType ? defaultPrompts[variantType] : `基于当前 D.O.E.S 参数（${selectedDim} 主导）微调`));
+    if (lockEnv && !forcePrompt) promptText = `[LOCK_ENV] ${promptText}`;
     const manualDoes = variantType === undefined ? getDoes(frag.id) : undefined;
+    const basePayload = {
+      seed: seedId,
+      prompt: promptText,
+      originalText: frag.content,
+      manualDoes,
+      target: variantType,
+    };
     try {
-      const res = await fetch("/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "vary",
-          seed: seedId,
-          prompt,
-          originalText: frag.content,
-          manualDoes: variantType === undefined ? manualDoes : undefined,
-          target: variantType,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "请求失败");
-      const results = Array.isArray(data) ? data : [data];
-      const first = results[0];
-      if (first?.text && first?.meta?.seed) {
-        onFragmentRewrite?.(frag.id, { content: first.text, seedId: first.meta.seed });
+      const action =
+        forcePrompt?.includes("[UPSCALE]") ? "EDIT_UPSCALE_FRAGMENT" :
+        variantType !== undefined ? "EDIT_REWRITE_BY_VARIANT" :
+        "EDIT_REWRITE_FRAGMENT";
+      const first = await dispatchWorkflow({
+        action,
+        payload: basePayload,
+      }) as { text: string; seed: string } | null;
+      if (first?.text && first?.seed) {
+        onFragmentRewrite?.(frag.id, { content: first.text, seedId: first.seed });
       }
     } catch (err) {
-      console.error("[EditView] doRewrite:", err);
+      console.error("工厂加工失败:", err);
     } finally {
       setRewritingId(null);
     }

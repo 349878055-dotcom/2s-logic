@@ -1,5 +1,22 @@
 "use client";
 
+/**
+ * =====================================================================
+ * ⚛️ ATOM INDEX: src/app/page.tsx (ScriptWorkbench)
+ * =====================================================================
+ * 🎯 [业务逻辑]:
+ * 全局视图调度中心。负责管理侧边栏导航状态、个性化开关及各业务 View 的切换。
+ * 📥 [进 (Input)]:
+ * - 用户交互：点击侧边栏 Nav。
+ * - 全局状态：personalizeOn, activeNav。
+ * 📤 [出 (Output)]:
+ * - 渲染：对应的 View 组件 (Explore/Create/Edit/Transpiler 等)。
+ * 🔗 [牵连与边界]:
+ * - 依赖：调用 `src/views/` 下的所有大型业务组件。
+ * - 禁区：禁止在这里手写复杂的 API Fetch 逻辑，必须通过子组件分发。
+ * =====================================================================
+ */
+
 import {
   Compass, Wand2, Pencil, Archive, Palette, CheckSquare, Code2,
   ChevronRight as ChevronR,

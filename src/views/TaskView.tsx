@@ -3,6 +3,7 @@
 import { CheckSquare, Users, Cpu, Database, Brain, Activity, Zap, ArrowUpRight, ArrowLeft } from "lucide-react";
 import { useState } from "react";
 import { TASKS_DATA } from "@/lib/engines/constants";
+import { dispatchWorkflow } from "@/workflow_registry";
 
 // 排名任务 mock 数据：两两对比
 const RANK_LOGIC_PAIRS = [
@@ -36,8 +37,16 @@ export default function TaskView() {
   const pairs = isLogic ? RANK_LOGIC_PAIRS : isDialogue ? RANK_DIALOGUE_PAIRS : [];
   const currentPair = pairs[rankPairIdx];
 
-  const handleStartRank = (taskId: string) => {
+  const handleStartRank = async (taskId: string) => {
     if (taskId === "rank-logic" || taskId === "rank-dialogue") {
+      try {
+        await dispatchWorkflow({
+          action: "TASK_LAB_RANK_SESSION",
+          payload: { phase: "start", taskId },
+        });
+      } catch (e) {
+        console.error("工厂加工失败:", e);
+      }
       setSelectedRankTaskId(taskId);
       setRankPairIdx(0);
       setRankedCount(0);
@@ -46,7 +55,15 @@ export default function TaskView() {
     }
   };
 
-  const handlePick = (picked: "a" | "b") => {
+  const handlePick = async (picked: "a" | "b") => {
+    try {
+      await dispatchWorkflow({
+        action: "TASK_LAB_RANK_SESSION",
+        payload: { phase: "pick", picked, pairIdx: rankPairIdx },
+      });
+    } catch (e) {
+      console.error("工厂加工失败:", e);
+    }
     setRankedCount(c => c + 1);
     if (rankPairIdx < pairs.length - 1) {
       setRankPairIdx(i => i + 1);

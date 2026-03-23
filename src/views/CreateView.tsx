@@ -1,11 +1,11 @@
 "use client";
 
 import { Anchor, RefreshCw, Play, Plus, CheckCircle2, X } from "lucide-react";
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useEffect } from "react";
 import type { ScriptFragment, ConstraintInfo, ContentStream } from "@/lib/core/types";
-import { requestContentStream, requestAdopt } from "@/lib/engines/utils";
 import ConstraintBadge from "@/components/ConstraintBadge";
 import { useWillStore } from "@/lib/engines/willStore";
+import { dispatchWorkflow } from "@/workflow_registry";
 
 const _CARD_COLORS = ["#ef4444", "#3b82f6", "#f59e0b", "#10b981"];
 const _CARD_SPEEDS = [1.15, 0.82, 1.35, 0.91];
@@ -22,40 +22,16 @@ export default function CreateView({
   anchorBtnRef: React.RefObject<HTMLButtonElement | null>;
   initialContext: { text: string; seed: string } | null;
 }) {
-  // ── 全局意志快照（Zustand）—— 切换侧边栏时内存常驻 ────
   const { streams, setStreams, prompt, setPrompt, hydrated, setHydrated } = useWillStore();
 
   const [referenceBox, setReferenceBox] = useState<{ text: string; seed: string; genre: string } | null>(null);
   const [loading, setLoading] = useState(false);
-  const [loadingCardIndex, setLoadingCardIndex] = useState<number | null>(null); // 局部演化时仅该卡片 loading
+  const [loadingCardIndex, setLoadingCardIndex] = useState<number | null>(null);
   const [progress, setProgress] = useState([0, 0, 0, 0]);
   const [adoptedIds, setAdoptedIds] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<string | null>(null);
   const [varyTarget, setVaryTarget] = useState<number | null>(null);
   const promptRef = useRef<HTMLInputElement>(null);
-
-  const _runGeneration = useCallback(async (input: { prompt: string; action?: "vary"; target?: number; seed?: string }) => {
-    setLoading(true);
-    setStreams(null);
-    setProgress([0, 0, 0, 0]);
-    const result = await requestContentStream(input);
-    setProgress([100, 100, 100, 100]);
-    setStreams(result);
-    setLoading(false);
-  }, [setStreams]);
-
-  /** 局部演化：仅更新指定卡片，其他卡片保留原内容 */
-  const _runVaryCard = useCallback(async (cardIndex: number, input: { prompt: string; action: "vary"; target: number; seed: string }) => {
-    setLoadingCardIndex(cardIndex);
-    setProgress(prev => { const n = [...prev]; n[cardIndex] = 0; return n; });
-    const result = await requestContentStream(input);
-    setProgress(prev => { const n = [...prev]; n[cardIndex] = 100; return n; });
-    const prev = useWillStore.getState().streams;
-    const next = [...(prev || [])];
-    next[cardIndex] = Array.isArray(result) ? result[0] : result;
-    setStreams(next);
-    setLoadingCardIndex(null);
-  }, [setStreams]);
 
   useEffect(() => {
     if (!loading && loadingCardIndex === null) return;
@@ -75,56 +51,97 @@ export default function CreateView({
 
   useEffect(() => {
     if (initialContext) {
-      setReferenceBox({ ...initialContext, genre: "" }); // genre 暂时为空
-      setPrompt(""); // 清空 input 的 prompt，只接收用户新输入
+      setReferenceBox({ ...initialContext, genre: "" });
+      setPrompt("");
       promptRef.current?.focus();
     }
   }, [initialContext, setPrompt]);
 
-  // ── 历史拉取钩子（仿 MJ 恢复最后一次任务现场）────────────
-  // hydrated 为 true 时跳过，防止切换侧边栏重复触发
   useEffect(() => {
     if (hydrated) return;
     setHydrated(true);
-    fetch("/api/history")
-      .then(r => r.json())
-      .then((data: { lastJob: { samples: ContentStream[]; prompt: string } | null }) => {
-        if (data.lastJob) {
-          setStreams(data.lastJob.samples);   // 恢复四宫格
-          setPrompt(data.lastJob.prompt);     // 恢复输入框内容
+    (async () => {
+      try {
+        const data = await dispatchWorkflow({ action: "CREATE_LOAD_HISTORY", payload: {} }) as {
+          lastJob: { samples: ContentStream[]; prompt: string } | null;
+        } | null;
+        if (data?.lastJob) {
+          setStreams(data.lastJob.samples);
+          setPrompt(data.lastJob.prompt);
         }
-      })
-      .catch(() => {}); // 静默失败，不影响正常使用
+      } catch {
+        /* 静默 */
+      }
+    })();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     const fullPrompt = referenceBox ? `${referenceBox.text} ${prompt}`.trim() : prompt.trim();
     if (!fullPrompt || loading) return;
     setVaryTarget(null);
-    _runGeneration({ prompt: fullPrompt, seed: referenceBox?.seed });
+    setLoading(true);
+    setStreams(null);
+    setProgress([0, 0, 0, 0]);
+    try {
+      const result = await dispatchWorkflow({
+        action: "CREATE_GENERATE_QUAD",
+        payload: {
+          sourceText: fullPrompt,
+          narrativeContext: constraint.charName
+            ? `当前约束角色：${constraint.charName}`
+            : "无额外约束",
+          referenceSeed: referenceBox?.seed || undefined,
+        },
+      }) as { streams: ContentStream[] };
+      setProgress([100, 100, 100, 100]);
+      setStreams(result.streams);
+    } catch (e) {
+      console.error("工厂加工失败:", e);
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const handleVary = (target: number, cardIndex: number) => {
+  const handleVary = async (target: number, cardIndex: number) => {
     if (loading || loadingCardIndex !== null) return;
     const baseStream = streams?.[cardIndex];
     if (!baseStream) return;
     setVaryTarget(target);
-    _runVaryCard(cardIndex, {
-      prompt: prompt || baseStream.text.slice(0, 80),
-      action: "vary",
-      target,
-      seed: baseStream.meta.seed,
-    });
+    setLoadingCardIndex(cardIndex);
+    setProgress(prev => { const n = [...prev]; n[cardIndex] = 0; return n; });
+    try {
+      const row = await dispatchWorkflow({
+        action: "CREATE_VARY_CARD",
+        payload: {
+          prompt: prompt || baseStream.text.slice(0, 80),
+          target,
+          seed: baseStream.meta.seed,
+        },
+      }) as ContentStream | ContentStream[];
+      setProgress(prev => { const n = [...prev]; n[cardIndex] = 100; return n; });
+      const one = Array.isArray(row) ? row[0] : row;
+      const prev = useWillStore.getState().streams;
+      const next = [...(prev || [])];
+      next[cardIndex] = one;
+      setStreams(next);
+    } catch (e) {
+      console.error("工厂加工失败:", e);
+    } finally {
+      setLoadingCardIndex(null);
+    }
   };
 
   const handleAdopt = async (stream: ContentStream) => {
     if (stream.meta.mode === "temp_variant" && stream.state) {
       try {
-        await requestAdopt({
-          seedId: stream.meta.seed,
-          tempState: stream.state,
-          prompt: prompt || undefined,
+        await dispatchWorkflow({
+          action: "CREATE_ADOPT_STREAM",
+          payload: {
+            seedId: stream.meta.seed,
+            tempState: stream.state,
+            prompt: prompt || undefined,
+          },
         });
       } catch (e) {
         setToast(`采纳固化失败：${e instanceof Error ? e.message : "未知错误"}`);
@@ -156,7 +173,6 @@ export default function CreateView({
         </div>
       )}
 
-      {/* 指令输入栏 */}
       <div className="flex-shrink-0 px-6 py-4 border-b" style={{ borderColor: "rgba(255,255,255,0.06)" }}>
         <ConstraintBadge info={constraint} />
           <div className="relative flex items-center gap-3">
@@ -174,12 +190,12 @@ export default function CreateView({
             </div>
             <input ref={promptRef} value={prompt}
               onChange={e => setPrompt(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && handleSubmit()}
+              onKeyDown={e => e.key === "Enter" && void handleSubmit()}
               placeholder="描述你的场景：时间、地点、关键冲突……"
               className="flex-1 bg-[#111116] border rounded-xl px-4 py-3 text-[13px] text-[#d1d5db] placeholder:text-[#374151] outline-none transition-all duration-200"
               style={{ borderColor: loading ? "rgba(239,68,68,0.25)" : "rgba(255,255,255,0.08)" }}
             />
-          <button onClick={handleSubmit} disabled={loading || !prompt.trim()}
+          <button onClick={() => void handleSubmit()} disabled={loading || !prompt.trim()}
             className="flex items-center gap-2 px-5 py-3 rounded-xl text-[12.5px] font-semibold transition-all flex-shrink-0"
             style={{
               background: loading ? "rgba(239,68,68,0.06)" : prompt.trim() ? "rgba(239,68,68,0.15)" : "rgba(255,255,255,0.04)",
@@ -215,7 +231,6 @@ export default function CreateView({
         </div>
       </div>
 
-      {/* 四宫格 */}
       <div className="flex-1 overflow-y-auto p-5">
         {!hasContent && (
           <div className="h-full flex flex-col items-center justify-center gap-5">
@@ -237,7 +252,7 @@ export default function CreateView({
               const color = _CARD_COLORS[i];
               const prog = progress[i];
               const stream = streams?.[i];
-              const isThisCardLoading = loadingCardIndex === i; // 局部演化时仅该卡片显示 loading
+              const isThisCardLoading = loadingCardIndex === i;
               const displayStream = isThisCardLoading ? null : stream;
 
               return (
@@ -289,7 +304,7 @@ export default function CreateView({
                           })()}
                         </div>
                         <div className="flex items-center gap-2">
-                          <button onClick={() => handleAdopt(displayStream)} disabled={adoptedIds.has(displayStream.id)}
+                          <button onClick={() => void handleAdopt(displayStream)} disabled={adoptedIds.has(displayStream.id)}
                             className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold transition-all"
                             style={adoptedIds.has(displayStream.id)
                               ? { background: "rgba(16,185,129,0.1)", color: "#10b981", border: "0.5px solid rgba(16,185,129,0.22)" }
@@ -310,7 +325,7 @@ export default function CreateView({
                         style={{ borderColor: "rgba(255,255,255,0.04)" }}>
                         <span className="text-[8px] font-mono text-[#2d2d35] mr-0.5">定向演化</span>
                         {[1,2,3,4].map(n => (
-                          <button key={n} onClick={() => handleVary(n, i)} disabled={loading || loadingCardIndex !== null}
+                          <button key={n} onClick={() => void handleVary(n, i)} disabled={loading || loadingCardIndex !== null}
                             className="px-2 py-1 rounded-md text-[8.5px] font-medium transition-all hover:opacity-90"
                             style={{
                               color: varyTarget === n ? _CARD_COLORS[n-1] : "#374151",
